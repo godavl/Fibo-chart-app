@@ -193,12 +193,26 @@ if search_btn and user_input:
 {ohlcv_data}
                         """
 
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=prompt
-                        )
-                        
-                        st.markdown(response.text)
+                        # 💡 최신 모델 우선 순위 목록 (실패 시 차선책으로 자동 이동)
+                        candidate_models = ['gemini-3.6-flash', 'gemini-flash', 'gemini-pro']
+                        response = None
+
+                        for model_name in candidate_models:
+                            try:
+                                response = client.models.generate_content(
+                                    model=model_name,
+                                    contents=prompt
+                                )
+                                if response and hasattr(response, 'text'):
+                                    break
+                            except Exception as model_err:
+                                print(f"Model {model_name} 호출 실패, 다음 모델로 시도: {model_err}")
+                                continue
+
+                        if response and hasattr(response, 'text'):
+                            st.markdown(response.text)
+                        else:
+                            st.error("모든 Gemini AI 모델 응답에 실패했습니다. API 키나 네트워크를 확인해 주세요.")
 
                     except Exception as e:
                         st.error(f"AI 분석 생성 실패: {e}")
