@@ -10,6 +10,7 @@ import os
 import json
 import re
 import time
+import random
 import concurrent.futures
 from datetime import date
 
@@ -113,12 +114,37 @@ st.caption("개별 주식뿐만 아니라 S&P500, 코스피 등 시장 지수도
 # ==========================================
 # 3. 공통 유틸리티
 # ==========================================
+import random
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_stock_data_cached(ticker: str, period: str = "1y", max_retries: int = 3) -> pd.DataFrame:
     session = requests.Session()
+    # 야후 파이낸스 차단을 우회하기 위한 브라우저 가장(User-Agent) 랜덤 설정
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0"
+    ]
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": random.choice(user_agents),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
     })
+
+    delay = 5
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(ticker, session=session)
+            df = stock.history(period=period)
+            if not df.empty:
+                return df
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise Exception(f"데이터 수집 실패 ({max_retries}회 시도 초과): {e}")
+        
+        time.sleep(delay * (attempt + 1))
+        
+    raise Exception(f"'{ticker}' 데이터를 불러올 수 없습니다. 잠시 후 다시 시도해 주세요.")
 
     delay = 3
     for attempt in range(max_retries):
