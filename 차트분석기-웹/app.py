@@ -1,273 +1,324 @@
+# -*- coding: utf-8 -*-
+"""
+app.py - 피보나치 + 매크로 다중 에이전트 통합 분석 대시보드
+- .env 또는 st.secrets를 통한 API 키 자동 로딩 지원 (자동 채움)
+- 1단계 & 2단계 멀티스레드 병렬 실행 (ThreadPoolExecutor)
+- 3단계 종합 중재 에이전트를 통한 최종 시나리오 조정
+"""
+
+import os
+import json
+import re
+import concurrent.futures
+from datetime import date
+
 import streamlit as st
 import yfinance as yf
-import matplotlib.pyplot as plt
 import pandas as pd
-import numpy as np
-from scipy.signal import argrelextrema
-import requests
 import google.generativeai as genai
+from dotenv import load_dotenv
 
-# --- 1. 페이지 설정 ---
-st.set_page_config(page_title="통합 글로벌 & KRX AI 피보나치 대시보드", layout="wide")
-st.title("📈 글로벌 주식/매크로 & 피보나치 AI 분석 대시보드")
+# .env 파일이 존재하면 환경 변수로 자동 로드
+load_dotenv()
 
-# --- 2. API 키 및 설정 (사이드바) ---
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-DATA_GO_KR_KEY = st.secrets.get("DATA_GO_KR_KEY", "")  # 공공데이터포털 인증키
+# ==========================================
+# 1. 페이지 및 기본 설정
+# ==========================================
+st.set_page_config(
+    page_title="Multi-Agent AI Trading Dashboard",
+    page_icon="📈",
+    layout="wide"
+)
 
-with st.sidebar:
-    st.header("⚙️ API 키 설정")
-    user_gemini_key = st.text_input("Gemini API Key", value=GEMINI_API_KEY, type="password")
-    user_datago_key = st.text_input("공공데이터포털 API Key", value=DATA_GO_KR_KEY, type="password")
-    
-    if user_gemini_key:
-        GEMINI_API_KEY = user_gemini_key
-    if user_datago_key:
-        DATA_GO_KR_KEY = user_datago_key
+st.title("📈 Multi-Agent 피보나치 & 매크로 종합 분석 시스템")
+st.caption("독립된 기술적 분석과 매크로 수급 분석을 병렬 처리 후 AI 중재자가 최종 시나리오를 조정합니다.")
 
-# --- 3. 데이터 수집 함수 (캐싱 적용) ---
-
-# 3-1. 주가 데이터 수집 (yfinance)
-@st.cache_data(ttl=3600)
-def fetch_stock_data(ticker_code: str, period: str = "120d"):
-    try:
-        df = yf.download(ticker_code, period=period, progress=False)
-        if df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception as e:
-        st.error(f"[{ticker_code}] yfinance 데이터 수집 실패: {e}")
-        return None
-
-# 3-2. 글로벌 매크로 지표 수집 (환율 및 미국 국채 금리)
-@st.cache_data(ttl=3600)
-def fetch_macro_indicators():
-    macro_data = {}
-    try:
-        # USD/KRW, USD/JPY, US 10Y Yield (^TNX)
-        tickers = {"USD_KRW": "KRW=X", "USD_JPY": "JPY=X", "US_10Y": "^TNX"}
-        for name, sym in tickers.items():
-            df = yf.download(sym, period="5d", progress=False)
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                macro_data[name] = float(df['Close'].iloc[-1])
-    except Exception as e:
-        print(f"매크로 지표 수집 제한: {e}")
-    return macro_data
-
-# 3-3. 한국 주식 공공데이터포털 API 수급 수집
-@st.cache_data(ttl=3600)
-def fetch_krx_info(ticker_digits: str, service_key: str):
-    if not service_key or not ticker_digits.isdigit():
-        return None
-    
-    url = "http://apis.data.go.kr/1160100/service/GetStockMarketInfoService/getStockMarketInfo"
-    params = {
-        'serviceKey': service_key,
-        'numOfRows': '5',
-        'pageNo': '1',
-        'resultType': 'json',
-        'likeShtnIscd': ticker_digits
-    }
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        if res.status_code == 200:
-            items = res.json().get('response', {}).get('body', {}).get('items', {}).get('item', [])
-            if items:
-                latest = items[0]
-                return {
-                    "fltRt": latest.get('fltRt', 'N/A'),        # 등락률
-                    "clpr": latest.get('clpr', 'N/A'),          # 종가
-                    "mrktTotAmt": latest.get('mrktTotAmt', 'N/A')# 시가총액
-                }
-    except Exception as e:
-        print(f"공공데이터포털 수급 조회 실패: {e}")
-    return None
-
-# --- 4. 변곡점(P1~P4) 및 피보나치 계산 알고리즘 ---
-def detect_pivots_and_fibonacci(df, order=5):
-    close_prices = df['Close'].values
-    dates = df.index
-    
-    # scipy를 활용한 지역 고점(Peaks) 및 저점(Troughs) 실제 계산
-    high_idx = argrelextrema(close_prices, np.greater, order=order)[0]
-    low_idx = argrelextrema(close_prices, np.less, order=order)[0]
-    
-    pivots = []
-    for idx in high_idx:
-        pivots.append({'type': 'High', 'date': dates[idx], 'price': float(close_prices[idx]), 'idx': idx})
-    for idx in low_idx:
-        pivots.append({'type': 'Low', 'date': dates[idx], 'price': float(close_prices[idx]), 'idx': idx})
-        
-    pivots = sorted(pivots, key=lambda x: x['date'])
-    recent_pivots = pivots[-4:] if len(pivots) >= 4 else pivots
-    
-    # P1~P4 포맷팅
-    pivot_dict = {}
-    for i, p in enumerate(recent_pivots, 1):
-        pivot_dict[f"P{i}"] = {
-            "type": p['type'],
-            "date": p['date'].strftime('%Y-%m-%d'),
-            "price": p['price'],
-            "idx": p['idx']
-        }
-        
-    # 피보나치 레벨 계산 (120일 최고/최저 기준)
-    high_p = float(df['High'].max())
-    low_p = float(df['Low'].min())
-    diff = high_p - low_p
-    
-    fib_levels = {
-        "0.000 (High)": high_p,
-        "0.236": high_p - 0.236 * diff,
-        "0.382": high_p - 0.382 * diff,
-        "0.500": high_p - 0.500 * diff,
-        "0.618": high_p - 0.618 * diff,
-        "0.786": high_p - 0.786 * diff,
-        "1.000 (Low)": low_p
-    }
-    
-    return pivot_dict, fib_levels
-
-# --- 5. 차트 시각화 (피봇 포인트 P1~P4 표시 포함) ---
-def plot_fibonacci_chart(df, ticker, fib_levels, pivot_dict):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(df.index, df['Close'], label='Close Price', color='#1f77b4', linewidth=1.5)
-    
-    # 피보나치 선 그리기
-    colors = ['red', 'orange', 'green', 'blue', 'purple', 'brown', 'black']
-    for (label, level), color in zip(fib_levels.items(), colors):
-        ax.axhline(level, linestyle='--', alpha=0.5, color=color, label=f"{label}: {level:,.2f}")
-        
-    # [핵심] 알고리즘이 탐지한 실제 P1~P4 피봇 포인트 차트에 시각화
-    for p_name, p_data in pivot_dict.items():
-        marker_color = 'red' if p_data['type'] == 'High' else 'green'
-        ax.scatter(pd.to_datetime(p_data['date']), p_data['price'], color=marker_color, s=80, zorder=5)
-        ax.annotate(
-            f"{p_name} ({p_data['price']:,.0f})",
-            (pd.to_datetime(p_data['date']), p_data['price']),
-            textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9, fontweight='bold'
-        )
-
-    ax.set_title(f"[{ticker}] Fibonacci Chart & Detected Pivot Points (P1~P4)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.grid(True, linestyle=':', alpha=0.5)
-    ax.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize='small')
-    plt.tight_layout()
-    return fig
-
-# --- 6. Gemini AI 동기화 분석 함수 ---
-def get_gemini_analysis(api_key, ticker, df, fib_levels, pivot_dict, volume_ratio, macro_data, krx_info):
-    if not api_key:
-        return "❌ Gemini API 키를 설정해 주세요."
-
+# ==========================================
+# 2. 공통 유틸리티 (모델 탐색 & JSON 파서)
+# ==========================================
+def get_dynamic_flash_models(api_key: str) -> list:
+    """Gemini API에서 이용 가능한 최신 Flash 모델 목록을 동적으로 탐색합니다."""
     genai.configure(api_key=api_key)
-
-    # 동적 Flash 모델 탐색
-    candidate_models = []
     try:
         all_models = genai.list_models()
+        candidate_models = []
         for m in all_models:
             if 'generateContent' in m.supported_generation_methods and 'flash' in m.name.lower():
                 candidate_models.append(m.name.replace('models/', ''))
+        
         candidate_models = sorted(list(set(candidate_models)), reverse=True)
+        return candidate_models if candidate_models else ['gemini-2.5-flash', 'gemini-1.5-flash']
     except Exception as e:
-        print(f"모델 동적 탐색 실패, 백업 목록 사용: {e}")
-        candidate_models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
+        st.warning(f"모델 실시간 탐색 실패, 기본 백업 모델 사용: {e}")
+        return ['gemini-2.5-flash', 'gemini-1.5-flash']
 
-    if not candidate_models:
-        candidate_models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
 
-    latest_price = float(df['Close'].iloc[-1])
-    fib_summary = "\n".join([f"- {k}: {v:,.2f}" for k, v in fib_levels.items()])
-    pivot_summary = "\n".join([f"- {k} ({v['type']}): {v['date']}일자 {v['price']:,.2f}원" for k, v in pivot_dict.items()])
-    
-    macro_str = f"원/달러: {macro_data.get('USD_KRW', 'N/A'):,.1f}원 | 엔/달러: {macro_data.get('USD_JPY', 'N/A'):,.1f}엔 | 미 10년물 금리: {macro_data.get('US_10Y', 'N/A'):.2f}%"
-    krx_str = f"등락률: {krx_info.get('fltRt', 'N/A')}% | 시가총액: {krx_info.get('mrktTotAmt', 'N/A')}원" if krx_info else "해당 없음 (외국/코인 종목)"
+def _parse_json_robust(text: str) -> dict:
+    """3단계 방어적 JSON 파서: 마크다운/텍스트 혼잡 시 정규식으로 안전 추출"""
+    if not text:
+        return {"error": "응답 텍스트가 비어있습니다.", "overall_macro_judgment": "neutral"}
 
-    prompt = f"""
-당신은 월스트리트 수석 기술적 분석가입니다.
-제공된 **실제 차트 피봇 데이터(P1~P4)**와 **피보나치 구간**만을 바탕으로 [{ticker}] 정밀 보고서를 작성하세요.
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
 
-[실제 차트 탐지 피봇 포인트 (P1~P4)] - *이 숫자만 참조하세요*
-{pivot_summary}
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
 
-[피보나치 주요 지지/저항 구간]
-{fib_summary}
+    return {
+        "parse_error": True,
+        "raw_text": text,
+        "overall_macro_judgment": "neutral",
+        "overall_macro_reasoning": "JSON 파싱 예외 발생으로 기본값 적용"
+    }
 
-[수급 및 시장 상황]
-- 현재가: {latest_price:,.2f}
-- 최근 20일 대비 거래량 배율: {volume_ratio:.2f}배
-- 공공데이터 수급 정보: {krx_str}
-- 글로벌 매크로 지표: {macro_str}
 
-[작성 지침]
-1. 위에서 제공된 P1~P4 피봇 가격 및 날짜만을 정확히 인용하여 현재 가격 흐름을 평가하세요.
-2. 매크로 환경(환율, 금리)과 거래량 배율({volume_ratio:.2f}배)이 종목 지지에 미치는 영향을 분석하세요.
-3. [실전 대응 지침] 섹션에 목표가, 분할 매수 진입가, 손절가를 명확한 수치로 제시하세요.
+def guess_asset_type(symbol: str) -> str:
+    """티커 포맷으로 주식/암호화폐 구별"""
+    s = symbol.upper().strip()
+    return "암호화폐" if s.endswith("-USD") or s.startswith("BTC") or "KRW-" in s else "주식"
+
+# ==========================================
+# 3. 에이전트 프롬프트 및 실행 함수
+# ==========================================
+
+# --- [1단계: 기술적 분석] ---
+STAGE1_PROMPT_TEMPLATE = """너는 피보나치 되돌림 및 기술적 차트 분석 전문가다.
+매크로, 뉴스, 거시경제 지표는 완전히 배제하고 오직 제공된 주가/기술 데이터만으로 분석하라.
+
+분석 대상: {symbol} ({asset_type})
+최근 Price Data Summary:
+{data_summary}
+
+반드시 아래 형식과 규칙을 포함하여 리포트를 작성하라:
+1. 현재 주요 추세 및 피보나치 레벨 분석
+2. 시나리오 A (상승/반등) 및 시나리오 B (하강/조정) 제시
+3. 반드시 리포트 하단에 정량 확률 수치를 아래 명확한 양식 그대로 표기할 것:
+   - [시나리오 A 확률: XX%]
+   - [시나리오 B 확률: XX%]
 """
 
-    response_text = None
-    used_model = None
+def run_stage1(api_key: str, symbol: str, data_summary: str) -> str:
+    genai.configure(api_key=api_key)
+    candidate_models = get_dynamic_flash_models(api_key)
+    asset_type = guess_asset_type(symbol)
+    prompt = STAGE1_PROMPT_TEMPLATE.format(
+        symbol=symbol, asset_type=asset_type, data_summary=data_summary
+    )
 
     for model_name in candidate_models:
         try:
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            if response and response.text:
-                response_text = response.text
-                used_model = model_name
-                break
-        except Exception as e:
-            print(f"[{model_name}] 실행 오류: {e}")
+            res = model.generate_content(prompt)
+            if res and hasattr(res, 'text') and res.text:
+                return res.text
+        except Exception:
             continue
+    return "1단계 기술적 분석 응답 생성 실패"
 
-    if response_text:
-        return f"*(사용된 모델: `{used_model}`)*\n\n{response_text}"
+
+# --- [2단계: 매크로/수급/뉴스 분석] ---
+STAGE2_PROMPT_TEMPLATE = """너는 거시환경·수급·뉴스만 전문적으로 평가하는 매크로 애널리스트다.
+기술적 차트(지지/저항, 피보나치 등)는 완전히 배제하고, 순수 수급 및 뉴스로만 판단하라.
+
+분석 대상: {symbol} ({asset_type})
+오늘 날짜: {today}
+
+최신 데이터/뉴스를 검색·참고하여 아래 JSON 구조로만 출력하라. 마크다운 설명 금지.
+
+{{
+  "supply_demand": {{
+    "volume_spike_detected": boolean,
+    "judgment": "accumulation" | "distribution" | "neutral",
+    "reasoning": string
+  }},
+  "macro": {{
+    "rate_environment": string,
+    "fed_stance": "hawkish" | "dovish" | "neutral",
+    "judgment": "favorable" | "neutral" | "unfavorable"
+  }},
+  "news_events": [
+    {{ "headline": string, "type": "noise" | "structural", "summary": string }}
+  ],
+  "overall_macro_judgment": "favorable" | "neutral" | "unfavorable",
+  "overall_macro_reasoning": string
+}}
+"""
+
+def run_stage2(api_key: str, symbol: str) -> dict:
+    genai.configure(api_key=api_key)
+    candidate_models = get_dynamic_flash_models(api_key)
+    asset_type = guess_asset_type(symbol)
+    prompt = STAGE2_PROMPT_TEMPLATE.format(
+        symbol=symbol, asset_type=asset_type, today=date.today().isoformat()
+    )
+
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            res = model.generate_content(prompt)
+            if res and hasattr(res, 'text') and res.text:
+                return _parse_json_robust(res.text)
+        except Exception:
+            continue
+    return _parse_json_robust("")
+
+
+# --- [3단계: 종합 판단 및 확률 조정] ---
+STAGE3_PROMPT_TEMPLATE = """너는 독립된 ①기술적 분석 리포트와 ②매크로·수급 분석 JSON을 종합 조정하는 중재자다.
+①, ②의 원본 데이터를 다시 재해석하지 말고, 규칙에 맞춰 시나리오 확률만 최종 조정하라.
+
+조정 규칙:
+- 매크로가 favorable: 시나리오 A 확률 상향 조정
+- 매크로가 neutral: 원래 확률 유지
+- 매크로가 unfavorable: 시나리오 A 확률 하향 조정 및 리스크 방어 강화
+
+[① 기술적 분석 결과]
+{stage1_result}
+
+[② 매크로·수급 분석 결과]
+{stage2_result}
+
+반드시 아래 JSON 구조로만 응답하라.
+{{
+  "scenario_a": {{
+    "adjusted_probability_pct": number,
+    "reasoning": string
+  }},
+  "scenario_b": {{
+    "adjusted_probability_pct": number,
+    "reasoning": string
+  }},
+  "risk_management_notes": [string],
+  "final_recommendation": string
+}}
+"""
+
+def run_stage3(api_key: str, stage1_text: str, stage2_dict: dict) -> dict:
+    genai.configure(api_key=api_key)
+    candidate_models = get_dynamic_flash_models(api_key)
+    prompt = STAGE3_PROMPT_TEMPLATE.format(
+        stage1_result=stage1_text,
+        stage2_result=json.dumps(stage2_dict, ensure_ascii=False, indent=2)
+    )
+
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            res = model.generate_content(prompt)
+            if res and hasattr(res, 'text') and res.text:
+                return _parse_json_robust(res.text)
+        except Exception:
+            continue
+    return _parse_json_robust("")
+
+# ==========================================
+# 4. Streamlit 사이드바 (API 키 자동 로드 적용)
+# ==========================================
+# 1순위: .env 파일 / 환경 변수
+default_api_key = os.getenv("GEMINI_API_KEY", "")
+
+# 2순위: .streamlit/secrets.toml
+if not default_api_key and "GEMINI_API_KEY" in st.secrets:
+    default_api_key = st.secrets["GEMINI_API_KEY"]
+
+with st.sidebar:
+    st.header("⚙️ 설정")
+    api_key = st.text_input("Gemini API Key", value=default_api_key, type="password")
+    
+    if api_key:
+        st.caption("✅ API Key가 설정되었습니다.")
     else:
-        return "❌ Gemini AI 분석 생성에 실패했습니다. API 키 및 연결 상태를 확인해 주세요."
-
-# --- 7. 메인 UI 구성 ---
-ticker_input = st.text_input("종목 티커 입력 (예: EWY, NVDA, 035420, 7203.T)", value="035420")
-
-if st.button("통합 분석 시작 🚀"):
-    if not ticker_input:
-        st.warning("티커를 입력해 주세요.")
-    else:
-        raw_ticker = ticker_input.strip().upper()
+        st.caption("⚠️ `.env` 파일에 GEMINI_API_KEY를 등록하면 자동 입력됩니다.")
         
-        # 한국 숫자 코드 지원 (.KS)
-        ticker_code = f"{raw_ticker}.KS" if raw_ticker.isdigit() else raw_ticker
+    symbol = st.text_input("자산 티커 (예: NVDA, BTC-USD, AAPL)", value="NVDA")
+    period = st.selectbox("차트 조회 기간", ["3m", "6m", "1y"], index=1)
+    run_btn = st.button("🚀 종합 분석 실행", use_container_width=True)
 
-        with st.spinner(f"[{ticker_code}] 멀티 데이터 수집 중..."):
-            df = fetch_stock_data(ticker_code)
-            macro_data = fetch_macro_indicators()
-            krx_info = fetch_krx_info(raw_ticker, DATA_GO_KR_KEY) if raw_ticker.isdigit() else None
+# ==========================================
+# 5. 메인 분석 파이프라인
+# ==========================================
+if run_btn:
+    if not api_key:
+        st.error("Gemini API Key를 입력하거나 .env 파일에 GEMINI_API_KEY를 설정해주세요.")
+        st.stop()
 
-            if df is None or df.empty:
-                st.error("데이터를 가져오지 못했습니다. 티커명을 확인해 주세요.")
-            else:
-                # 거래량 배율 계산
-                recent_20_vol = float(df['Volume'].tail(20).mean())
-                current_vol = float(df['Volume'].iloc[-1])
-                volume_ratio = (current_vol / recent_20_vol) if recent_20_vol > 0 else 1.0
+    st.info(f"🔍 **{symbol}** 데이터를 수집하고 멀티 에이전트 분석을 시작합니다...")
 
-                # 피봇 포인트 및 피보나치 계산
-                pivot_dict, fib_levels = detect_pivots_and_fibonacci(df)
+    try:
+        ticker_obj = yf.Ticker(symbol)
+        df = ticker_obj.history(period=period)
+        if df.empty:
+            st.error("주가 데이터를 가져올 수 없습니다. 티커를 확인해주세요.")
+            st.stop()
 
-                # 1. 차트 출력
-                st.subheader("📊 피보나치 & P1~P4 피봇 동기화 차트")
-                fig = plot_fibonacci_chart(df, ticker_code, fib_levels, pivot_dict)
-                st.pyplot(fig)
+        recent_close = df['Close'].iloc[-1]
+        high_val = df['High'].max()
+        low_val = df['Low'].min()
+        data_summary = f"""- 최근 종가: {recent_close:.2f}
+- 기간 내 최고가: {high_val:.2f}
+- 기간 내 최저가: {low_val:.2f}
+- 최근 5일 거래량 평균: {df['Volume'].tail(5).mean():.0f}
+"""
+    except Exception as e:
+        st.error(f"데이터 수집 중 오류 발생: {e}")
+        st.stop()
 
-                # 2. AI 보고서 출력
-                st.subheader("🤖 Gemini AI 매크로 & 수급 연동 보고서")
-                with st.spinner("Gemini AI 분석 진행 중..."):
-                    report = get_gemini_analysis(
-                        GEMINI_API_KEY, ticker_code, df, fib_levels, pivot_dict, volume_ratio, macro_data, krx_info
-                    )
-                    st.markdown(report)
+    # 1단계 & 2단계 병렬 실행
+    with st.spinner("⚡ 1단계(기술적 분석) 및 2단계(매크로 수급) 동시 분석 중..."):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_stage1 = executor.submit(run_stage1, api_key, symbol, data_summary)
+            future_stage2 = executor.submit(run_stage2, api_key, symbol)
+
+            stage1_result_text = future_stage1.result()
+            stage2_result_json = future_stage2.result()
+
+    # 3단계 종합 판단 실행
+    with st.spinner("🤖 3단계 종합 중재 에이전트가 최종 확률을 조정 중..."):
+        stage3_result_json = run_stage3(api_key, stage1_result_text, stage2_result_json)
+
+    # ==========================================
+    # 6. 결과 출력 UI
+    # ==========================================
+    st.success("✅ 분석 완료!")
+
+    st.subheader("🎯 3단계: 최종 조정 시나리오 (AI 중재 결과)")
+    col1, col2 = st.columns(2)
+    with col1:
+        sc_a = stage3_result_json.get("scenario_a", {})
+        st.metric(
+            label="📈 시나리오 A (상승/반등 조정 확률)",
+            value=f"{sc_a.get('adjusted_probability_pct', 'N/A')}%"
+        )
+        st.write(f"**근거:** {sc_a.get('reasoning', '-')}")
+
+    with col2:
+        sc_b = stage3_result_json.get("scenario_b", {})
+        st.metric(
+            label="📉 시나리오 B (하락/조정 조정 확률)",
+            value=f"{sc_b.get('adjusted_probability_pct', 'N/A')}%"
+        )
+        st.write(f"**근거:** {sc_b.get('reasoning', '-')}")
+
+    st.markdown(f"**💡 최종 권고사항:** {stage3_result_json.get('final_recommendation', '-')}")
+    
+    with st.expander("🛡️ 리스크 관리 가이드라인"):
+        notes = stage3_result_json.get("risk_management_notes", [])
+        for note in notes:
+            st.write(f"- {note}")
+
+    st.divider()
+
+    tab1, tab2 = st.tabs(["📊 1단계: 독립 기술적 분석", "🌐 2단계: 매크로 · 수급 분석"])
+
+    with tab1:
+        st.markdown(stage1_result_text)
+
+    with tab2:
+        st.json(stage2_result_json)
