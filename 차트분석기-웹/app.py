@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 app.py - 피보나치 + 매크로 다중 에이전트 통합 분석 대시보드
-- .env 또는 st.secrets를 통한 API 키 자동 로딩 지원 (자동 채움)
-- 1단계 & 2단계 멀티스레드 병렬 실행 (ThreadPoolExecutor)
-- 3단계 종합 중재 에이전트를 통한 최종 시나리오 조정
+- yfinance 캐싱(@st.cache_data) & Rate Limit 자동 재시도(Retry) 적용
+- .env 및 st.secrets를 통한 Gemini API 키 자동 로딩
+- 1단계 & 2단계 멀티스레드 병렬 처리 (ThreadPoolExecutor)
+- 3단계 AI 중재 에이전트를 통한 확률 조정
 """
 
 import os
 import json
 import re
+import time
 import concurrent.futures
 from datetime import date
 
@@ -22,7 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==========================================
-# 1. 페이지 및 기본 설정
+# 1. 페이지 설정
 # ==========================================
 st.set_page_config(
     page_title="Multi-Agent AI Trading Dashboard",
@@ -34,8 +36,30 @@ st.title("📈 Multi-Agent 피보나치 & 매크로 종합 분석 시스템")
 st.caption("독립된 기술적 분석과 매크로 수급 분석을 병렬 처리 후 AI 중재자가 최종 시나리오를 조정합니다.")
 
 # ==========================================
-# 2. 공통 유틸리티 (모델 탐색 & JSON 파서)
+# 2. 공통 유틸리티 (캐싱, 모델 탐색 & JSON 파서)
 # ==========================================
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_stock_data_cached(ticker: str, period: str = "1y", max_retries: int = 3) -> pd.DataFrame:
+    """
+    10분 캐싱 및 야후 파이낸스 Rate Limit 대응 재시도(Retry) 함수
+    """
+    delay = 2  # 첫 대기 시간 (초)
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period)
+            if not df.empty:
+                return df
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise Exception(f"데이터 수집 실패 ({max_retries}회 시도 초과): {e}")
+        
+        # 차단 발생 시 2초 -> 4초 -> 6초 대기 후 재시도
+        time.sleep(delay * (attempt + 1))
+        
+    raise Exception(f"'{ticker}' 티커의 데이터를 불러올 수 없습니다. 티커명을 확인해 주세요.")
+
+
 def get_dynamic_flash_models(api_key: str) -> list:
     """Gemini API에서 이용 가능한 최신 Flash 모델 목록을 동적으로 탐색합니다."""
     genai.configure(api_key=api_key)
@@ -54,7 +78,7 @@ def get_dynamic_flash_models(api_key: str) -> list:
 
 
 def _parse_json_robust(text: str) -> dict:
-    """3단계 방어적 JSON 파서: 마크다운/텍스트 혼잡 시 정규식으로 안전 추출"""
+    """3단계 방어적 JSON 파서"""
     if not text:
         return {"error": "응답 텍스트가 비어있습니다.", "overall_macro_judgment": "neutral"}
 
@@ -219,12 +243,9 @@ def run_stage3(api_key: str, stage1_text: str, stage2_dict: dict) -> dict:
     return _parse_json_robust("")
 
 # ==========================================
-# 4. Streamlit 사이드바 (API 키 자동 로드 적용)
+# 4. Streamlit 사이드바
 # ==========================================
-# 1순위: .env 파일 / 환경 변수
 default_api_key = os.getenv("GEMINI_API_KEY", "")
-
-# 2순위: .streamlit/secrets.toml
 if not default_api_key and "GEMINI_API_KEY" in st.secrets:
     default_api_key = st.secrets["GEMINI_API_KEY"]
 
@@ -251,13 +272,9 @@ if run_btn:
 
     st.info(f"🔍 **{symbol}** 데이터를 수집하고 멀티 에이전트 분석을 시작합니다...")
 
+    # 1. 캐싱 및 자동 재시도가 적용된 데이터 수집
     try:
-        ticker_obj = yf.Ticker(symbol)
-        df = ticker_obj.history(period=period)
-        if df.empty:
-            st.error("주가 데이터를 가져올 수 없습니다. 티커를 확인해주세요.")
-            st.stop()
-
+        df = fetch_stock_data_cached(symbol, period=period)
         recent_close = df['Close'].iloc[-1]
         high_val = df['High'].max()
         low_val = df['Low'].min()
@@ -270,7 +287,7 @@ if run_btn:
         st.error(f"데이터 수집 중 오류 발생: {e}")
         st.stop()
 
-    # 1단계 & 2단계 병렬 실행
+    # 2. 1단계 & 2단계 병렬 실행
     with st.spinner("⚡ 1단계(기술적 분석) 및 2단계(매크로 수급) 동시 분석 중..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_stage1 = executor.submit(run_stage1, api_key, symbol, data_summary)
@@ -279,7 +296,7 @@ if run_btn:
             stage1_result_text = future_stage1.result()
             stage2_result_json = future_stage2.result()
 
-    # 3단계 종합 판단 실행
+    # 3. 3단계 종합 판단 실행
     with st.spinner("🤖 3단계 종합 중재 에이전트가 최종 확률을 조정 중..."):
         stage3_result_json = run_stage3(api_key, stage1_result_text, stage2_result_json)
 
