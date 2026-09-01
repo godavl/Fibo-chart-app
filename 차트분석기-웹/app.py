@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-app.py - 피보나치 + 매크로 다중 에이전트 통합 분석 대시보드
-- yfinance 캐싱(@st.cache_data) & Rate Limit 자동 재시도(Retry) 적용
+app.py - 피보나치 & 매크로 Multi-Agent 종합 분석 시스템
+- User-Agent 적용 및 10분 캐싱(@st.cache_data)으로 yfinance Rate Limit 방지
+- 차트 시각화(종가/거래량) 및 기간 옵션 확장(1m ~ max)
+- 2단계 매크로 분석 결과의 카드/메트릭 UI 스타일 적용
 - .env 및 st.secrets를 통한 Gemini API 키 자동 로딩
-- 1단계 & 2단계 멀티스레드 병렬 처리 (ThreadPoolExecutor)
-- 3단계 AI 중재 에이전트를 통한 확률 조정
+- 1, 2단계 병렬 처리(ThreadPoolExecutor) 및 3단계 확률 조정
 """
 
 import os
@@ -14,13 +15,14 @@ import time
 import concurrent.futures
 from datetime import date
 
+import requests
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# .env 파일이 존재하면 환경 변수로 자동 로드
+# .env 파일 로드
 load_dotenv()
 
 # ==========================================
@@ -36,17 +38,22 @@ st.title("📈 Multi-Agent 피보나치 & 매크로 종합 분석 시스템")
 st.caption("독립된 기술적 분석과 매크로 수급 분석을 병렬 처리 후 AI 중재자가 최종 시나리오를 조정합니다.")
 
 # ==========================================
-# 2. 공통 유틸리티 (캐싱, 모델 탐색 & JSON 파서)
+# 2. 공통 유틸리티 (User-Agent 수집, 캐싱, 모델 탐색 & JSON 파서)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_stock_data_cached(ticker: str, period: str = "1y", max_retries: int = 3) -> pd.DataFrame:
     """
-    10분 캐싱 및 야후 파이낸스 Rate Limit 대응 재시도(Retry) 함수
+    User-Agent 헤더 추가, 10분 캐싱 및 재시도(Retry)가 적용된 주가 수집 함수
     """
-    delay = 2  # 첫 대기 시간 (초)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    })
+
+    delay = 3
     for attempt in range(max_retries):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=session)
             df = stock.history(period=period)
             if not df.empty:
                 return df
@@ -54,7 +61,6 @@ def fetch_stock_data_cached(ticker: str, period: str = "1y", max_retries: int = 
             if attempt == max_retries - 1:
                 raise Exception(f"데이터 수집 실패 ({max_retries}회 시도 초과): {e}")
         
-        # 차단 발생 시 2초 -> 4초 -> 6초 대기 후 재시도
         time.sleep(delay * (attempt + 1))
         
     raise Exception(f"'{ticker}' 티커의 데이터를 불러올 수 없습니다. 티커명을 확인해 주세요.")
@@ -73,7 +79,7 @@ def get_dynamic_flash_models(api_key: str) -> list:
         candidate_models = sorted(list(set(candidate_models)), reverse=True)
         return candidate_models if candidate_models else ['gemini-2.5-flash', 'gemini-1.5-flash']
     except Exception as e:
-        st.warning(f"모델 실시간 탐색 실패, 기본 백업 모델 사용: {e}")
+        st.warning(f"모델 실시간 탐색 실패, 백업 모델 사용: {e}")
         return ['gemini-2.5-flash', 'gemini-1.5-flash']
 
 
@@ -112,7 +118,6 @@ def guess_asset_type(symbol: str) -> str:
 # 3. 에이전트 프롬프트 및 실행 함수
 # ==========================================
 
-# --- [1단계: 기술적 분석] ---
 STAGE1_PROMPT_TEMPLATE = """너는 피보나치 되돌림 및 기술적 차트 분석 전문가다.
 매크로, 뉴스, 거시경제 지표는 완전히 배제하고 오직 제공된 주가/기술 데이터만으로 분석하라.
 
@@ -147,7 +152,6 @@ def run_stage1(api_key: str, symbol: str, data_summary: str) -> str:
     return "1단계 기술적 분석 응답 생성 실패"
 
 
-# --- [2단계: 매크로/수급/뉴스 분석] ---
 STAGE2_PROMPT_TEMPLATE = """너는 거시환경·수급·뉴스만 전문적으로 평가하는 매크로 애널리스트다.
 기술적 차트(지지/저항, 피보나치 등)는 완전히 배제하고, 순수 수급 및 뉴스로만 판단하라.
 
@@ -194,7 +198,6 @@ def run_stage2(api_key: str, symbol: str) -> dict:
     return _parse_json_robust("")
 
 
-# --- [3단계: 종합 판단 및 확률 조정] ---
 STAGE3_PROMPT_TEMPLATE = """너는 독립된 ①기술적 분석 리포트와 ②매크로·수급 분석 JSON을 종합 조정하는 중재자다.
 ①, ②의 원본 데이터를 다시 재해석하지 말고, 규칙에 맞춰 시나리오 확률만 최종 조정하라.
 
@@ -259,7 +262,13 @@ with st.sidebar:
         st.caption("⚠️ `.env` 파일에 GEMINI_API_KEY를 등록하면 자동 입력됩니다.")
         
     symbol = st.text_input("자산 티커 (예: NVDA, BTC-USD, AAPL)", value="NVDA")
-    period = st.selectbox("차트 조회 기간", ["3m", "6m", "1y"], index=1)
+    
+    period = st.selectbox(
+        "차트 조회 기간", 
+        ["1m", "3m", "6m", "1y", "2y", "5y", "max"], 
+        index=3  # 기본값: 1y
+    )
+    
     run_btn = st.button("🚀 종합 분석 실행", use_container_width=True)
 
 # ==========================================
@@ -270,24 +279,24 @@ if run_btn:
         st.error("Gemini API Key를 입력하거나 .env 파일에 GEMINI_API_KEY를 설정해주세요.")
         st.stop()
 
-    st.info(f"🔍 **{symbol}** 데이터를 수집하고 멀티 에이전트 분석을 시작합니다...")
+    st.info(f"🔍 **{symbol}** ({period} 기간) 데이터를 수집하고 멀티 에이전트 분석을 시작합니다...")
 
-    # 1. 캐싱 및 자동 재시도가 적용된 데이터 수집
+    # 1. 데이터 수집
     try:
         df = fetch_stock_data_cached(symbol, period=period)
         recent_close = df['Close'].iloc[-1]
         high_val = df['High'].max()
         low_val = df['Low'].min()
         data_summary = f"""- 최근 종가: {recent_close:.2f}
-- 기간 내 최고가: {high_val:.2f}
-- 기간 내 최저가: {low_val:.2f}
+- 선택 기간 내 최고가: {high_val:.2f}
+- 선택 기간 내 최저가: {low_val:.2f}
 - 최근 5일 거래량 평균: {df['Volume'].tail(5).mean():.0f}
 """
     except Exception as e:
         st.error(f"데이터 수집 중 오류 발생: {e}")
         st.stop()
 
-    # 2. 1단계 & 2단계 병렬 실행
+    # 2. 병렬 AI 분석 실행
     with st.spinner("⚡ 1단계(기술적 분석) 및 2단계(매크로 수급) 동시 분석 중..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_stage1 = executor.submit(run_stage1, api_key, symbol, data_summary)
@@ -305,6 +314,7 @@ if run_btn:
     # ==========================================
     st.success("✅ 분석 완료!")
 
+    # 3단계 핵심 메트릭 카드
     st.subheader("🎯 3단계: 최종 조정 시나리오 (AI 중재 결과)")
     col1, col2 = st.columns(2)
     with col1:
@@ -332,10 +342,92 @@ if run_btn:
 
     st.divider()
 
-    tab1, tab2 = st.tabs(["📊 1단계: 독립 기술적 분석", "🌐 2단계: 매크로 · 수급 분석"])
+    # 탭 구성: 차트, 1단계, 2단계 UI
+    tab_chart, tab1, tab2 = st.tabs(["📉 주가 차트 흐름", "📊 1단계: 독립 기술적 분석", "🌐 2단계: 매크로 · 수급 분석"])
+
+    with tab_chart:
+        st.subheader(f"{symbol.upper()} 종가 추이 ({period})")
+        st.line_chart(df['Close'], use_container_width=True)
+        st.caption("📊 거래량 (Volume)")
+        st.bar_chart(df['Volume'], use_container_width=True)
 
     with tab1:
         st.markdown(stage1_result_text)
 
     with tab2:
-        st.json(stage2_result_json)
+        st.subheader("🌐 거시경제(Macro) 및 수급 동향 상세 분석")
+        
+        # 1) 종합 판단 패널
+        overall_j = str(stage2_result_json.get("overall_macro_judgment", "neutral")).lower()
+        overall_reason = stage2_result_json.get("overall_macro_reasoning", "분석 정보 없음")
+        
+        j_map = {
+            "favorable": ("🟢 우호적 (Favorable)", st.success),
+            "neutral": ("🟡 중립 (Neutral)", st.warning),
+            "unfavorable": ("🔴 비우호적 (Unfavorable)", st.error)
+        }
+        text, alert_func = j_map.get(overall_j, ("⚪ 판단 불가", st.info))
+        
+        st.markdown("#### 🎯 종합 매크로 판단")
+        alert_func(f"**{text}**\n\n{overall_reason}")
+            
+        st.divider()
+
+        # 2) 수급 동향 & 거시 환경 카드가 담긴 2열 분할
+        col_sd, col_mc = st.columns(2)
+
+        with col_sd:
+            st.markdown("### 📊 수급 동향 (Supply & Demand)")
+            sd = stage2_result_json.get("supply_demand", {})
+            
+            sd_j = str(sd.get("judgment", "neutral")).lower()
+            sd_map = {
+                "accumulation": "🟢 매집 (Accumulation)", 
+                "distribution": "🔴 분매 (Distribution)", 
+                "neutral": "🟡 중립 (Neutral)"
+            }
+            
+            spike = sd.get("volume_spike_detected", False)
+            spike_badge = "🚨 거래량 폭증 감지" if spike else "⚪ 거래량 정상"
+            
+            st.metric(label="수급 상태", value=sd_map.get(sd_j, sd_j))
+            st.caption(f"**거래량 패턴:** {spike_badge}")
+            st.write(f"**수급 근거:** {sd.get('reasoning', '-')}")
+
+        with col_mc:
+            st.markdown("### 🏦 거시 환경 (Macro Economy)")
+            mc = stage2_result_json.get("macro", {})
+            
+            fed_s = str(mc.get("fed_stance", "neutral")).lower()
+            fed_map = {
+                "hawkish": "🦅 매파적 (Hawkish)", 
+                "dovish": "🕊️ 비둘기파적 (Dovish)", 
+                "neutral": "⚖️ 중립 (Neutral)"
+            }
+            
+            st.metric(label="Fed 통화정책 기조", value=fed_map.get(fed_s, fed_s))
+            st.markdown(f"**금리 환경:** {mc.get('rate_environment', '-')}")
+            st.write(f"**매크로 평가:** {mc.get('judgment', '-')}")
+
+        st.divider()
+
+        # 3) 주요 뉴스 리스트
+        st.markdown("### 📰 주요 뉴스 & 영향 평가")
+        news_list = stage2_result_json.get("news_events", [])
+        
+        if news_list and isinstance(news_list, list):
+            for i, item in enumerate(news_list, 1):
+                headline = item.get("headline", "제목 없음")
+                n_type = str(item.get("type", "noise")).lower()
+                summary = item.get("summary", "-")
+                
+                tag = "📌 [구조적 변수]" if n_type == "structural" else "🌊 [단기 노이즈]"
+                
+                with st.expander(f"{tag} {headline}"):
+                    st.write(summary)
+        else:
+            st.info("수집된 주요 뉴스 및 이벤트가 없습니다.")
+
+        # 4) 원본 Raw JSON 접기
+        with st.expander("🔍 원본 Raw JSON 데이터 보기"):
+            st.json(stage2_result_json)
